@@ -6,6 +6,11 @@ import lightgbm as lgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
 
+# [추가] MLflow 및 스키마 추론 라이브러리
+import mlflow
+import mlflow.lightgbm
+from mlflow.models import infer_signature
+
 # ==========================================
 # 1. Parquet 데이터 로드 및 사용자 정의 분할 로직
 # ==========================================
@@ -14,7 +19,7 @@ if os.path.exists('/content/drive/MyDrive'):
 else:
     FINAL_WORK_DIR = os.getenv('DATA_DIR', './your_data_path_here')
 
-print("Parquet 데이터 로드 중...")
+print("Parquet 데이터 로드 중")
 df_train_full = pd.read_parquet(os.path.join(FINAL_WORK_DIR, 'train_10000.parquet'))
 df_val_full = pd.read_parquet(os.path.join(FINAL_WORK_DIR, 'val_3000.parquet'))
 
@@ -41,10 +46,7 @@ for df in [train_df, val_df, test_df]:
     if 'speed_ms' in df.columns and 'speed' not in df.columns:
         df['speed'] = df['speed_ms']
 
-print(f"데이터 분할 완료!")
-print(f" - Train: 트립 {len(train_df['trip_id'].unique()):,}개 | 포인트 {len(train_df):,}개")
-print(f" - Validation: 트립 {len(val_df['trip_id'].unique()):,}개 | 포인트 {len(val_df):,}개")
-print(f" - Test: 트립 {len(test_df['trip_id'].unique()):,}개 | 포인트 {len(test_df):,}개")
+print(f"데이터 분할 완료")
 
 
 # ==========================================
@@ -73,7 +75,7 @@ test_df = apply_compact_labels(test_df)
 
 
 # ==========================================
-# 3. 피처 엔지니어링 함수 정의 (v3)
+# 3. 피처 엔지니어링 함수 정의
 # ==========================================
 def calculate_bearing(lat1, lon1, lat2, lon2):
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
@@ -148,7 +150,7 @@ test_df = extract_advanced_features_v3(test_df)
 
 
 # ==========================================
-# 4. LightGBM 모델 학습
+# 4. LightGBM 모델 학습 및 MLflow 로깅
 # ==========================================
 features = [
     'speed', 'acceleration', 'distance', 'bearing_change',
@@ -161,110 +163,118 @@ features = [
 X_train, y_train = train_df[features], train_df['mode_compact']
 X_val, y_val = val_df[features], val_df['mode_compact']
 
-print("LightGBM 모델 학습 시작...")
-model = lgb.LGBMClassifier(
-    n_estimators=300,
-    learning_rate=0.05,
-    max_depth=8,
-    random_state=42,
-    n_jobs=-1
-)
+with mlflow.start_run() as run:
+    params = {
+        "n_estimators": 300,
+        "learning_rate": 0.05,
+        "max_depth": 8,
+        "random_state": 42
+    }
+    mlflow.log_params(params)
 
-model.fit(
-    X_train, y_train,
-    eval_set=[(X_val, y_val)],
-    callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)]
-)
+    print("LightGBM 모델 학습 시작...")
+    model = lgb.LGBMClassifier(**params, n_jobs=-1)
+    
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)]
+    )
 
+    # ==========================================
+    # 5. 테스트 셋 추론 및 보완된 스무딩 적용
+    # ==========================================
+    def apply_balanced_smoothing_to_test(df, model, features, chunk_size=300, window_size=21):
+        processed_chunks = []
+        for trip_id, group in df.groupby('trip_id'):
+            group = group.reset_index(drop=True)
+            total_len = len(group)
 
-# ==========================================
-# 5. 테스트 셋 추론 및 보완된 스무딩 적용
-# ==========================================
-def apply_balanced_smoothing_to_test(df, model, features, chunk_size=300, window_size=21):
-    processed_chunks = []
-    for trip_id, group in df.groupby('trip_id'):
-        group = group.reset_index(drop=True)
-        total_len = len(group)
+            for start_idx in range(0, total_len, chunk_size):
+                end_idx = min(start_idx + chunk_size, total_len)
+                chunk = group.iloc[start_idx:end_idx].copy()
 
-        for start_idx in range(0, total_len, chunk_size):
-            end_idx = min(start_idx + chunk_size, total_len)
-            chunk = group.iloc[start_idx:end_idx].copy()
+                if len(chunk) < 5:
+                    continue
 
-            if len(chunk) < 5:
-                continue
+                chunk['pred_mode_compact'] = model.predict(chunk[features])
+                chunk['smoothed_mode_compact'] = chunk['pred_mode_compact'].rolling(
+                    window=window_size, center=True, min_periods=1
+                ).apply(lambda s: pd.Series(s).mode()[0], raw=False).astype(int)
 
-            chunk['pred_mode_compact'] = model.predict(chunk[features])
-            chunk['smoothed_mode_compact'] = chunk['pred_mode_compact'].rolling(
-                window=window_size, center=True, min_periods=1
-            ).apply(lambda s: pd.Series(s).mode()[0], raw=False).astype(int)
+                processed_chunks.append(chunk)
 
-            processed_chunks.append(chunk)
+        return pd.concat(processed_chunks, ignore_index=True)
 
-    return pd.concat(processed_chunks, ignore_index=True)
+    test_smoothed_df = apply_balanced_smoothing_to_test(test_df, model, features, window_size=21)
 
-test_smoothed_df = apply_balanced_smoothing_to_test(test_df, model, features, window_size=21)
+    def balanced_clean_segments_compact(df_subset, mode_col='smoothed_mode_compact', min_len=10):
+        modes = df_subset[mode_col].values.copy()
+        if len(modes) == 0:
+            return modes
 
-def balanced_clean_segments_compact(df_subset, mode_col='smoothed_mode_compact', min_len=10):
-    modes = df_subset[mode_col].values.copy()
-    if len(modes) == 0:
+        changed = True
+        iteration = 0
+        while changed and iteration < 5:
+            changed = False
+            iteration += 1
+
+            segments = []
+            start = 0
+            for i in range(1, len(modes)):
+                if modes[i] != modes[start]:
+                    segments.append({'start': start, 'end': i - 1, 'mode': modes[start]})
+                    start = i
+            segments.append({'start': start, 'end': len(modes) - 1, 'mode': modes[start]})
+
+            for idx, seg in enumerate(segments):
+                length = seg['end'] - seg['start'] + 1
+                if length < min_len and len(segments) > 1:
+                    if 0 < idx < len(segments) - 1:
+                        prev_len = segments[idx-1]['end'] - segments[idx-1]['start'] + 1
+                        next_len = segments[idx+1]['end'] - segments[idx+1]['start'] + 1
+                        target_mode = segments[idx-1]['mode'] if prev_len >= next_len else segments[idx+1]['mode']
+                    elif idx > 0:
+                        target_mode = segments[idx-1]['mode']
+                    else:
+                        target_mode = segments[idx+1]['mode']
+
+                    modes[seg['start']:seg['end']+1] = target_mode
+                    changed = True
+                    break
+
         return modes
 
-    changed = True
-    iteration = 0
-    while changed and iteration < 5:
-        changed = False
-        iteration += 1
+    super_cleaned_compact_modes = []
+    for _, group in test_smoothed_df.groupby('trip_id'):
+        group = group.reset_index(drop=True)
+        refined_modes = balanced_clean_segments_compact(group, mode_col='smoothed_mode_compact', min_len=10)
+        super_cleaned_compact_modes.extend(refined_modes)
 
-        segments = []
-        start = 0
-        for i in range(1, len(modes)):
-            if modes[i] != modes[start]:
-                segments.append({'start': start, 'end': i - 1, 'mode': modes[start]})
-                start = i
-        segments.append({'start': start, 'end': len(modes) - 1, 'mode': modes[start]})
+    test_smoothed_df['super_cleaned_mode_compact'] = super_cleaned_compact_modes
 
-        for idx, seg in enumerate(segments):
-            length = seg['end'] - seg['start'] + 1
-            if length < min_len and len(segments) > 1:
-                if 0 < idx < len(segments) - 1:
-                    prev_len = segments[idx-1]['end'] - segments[idx-1]['start'] + 1
-                    next_len = segments[idx+1]['end'] - segments[idx+1]['start'] + 1
-                    target_mode = segments[idx-1]['mode'] if prev_len >= next_len else segments[idx+1]['mode']
-                elif idx > 0:
-                    target_mode = segments[idx-1]['mode']
-                else:
-                    target_mode = segments[idx+1]['mode']
+    # 성능 평가 지표 계산
+    y_true = test_smoothed_df['mode_compact'].values
+    y_pred = test_smoothed_df['super_cleaned_mode_compact'].values
+    accuracy = accuracy_score(y_true, y_pred)
+    
+    mlflow.log_metric("test_accuracy", accuracy)
+    print(f"Overall Accuracy: {accuracy * 100:.2f}%")
 
-                modes[seg['start']:seg['end']+1] = target_mode
-                changed = True
-                break
+    # ==========================================
+    # 6. MLflow 모델 등록
+    # ==========================================
+    input_example = X_val.head(5)
+    predicted_output = model.predict(input_example)
+    signature = infer_signature(input_example, predicted_output)
 
-    return modes
-
-super_cleaned_compact_modes = []
-for _, group in test_smoothed_df.groupby('trip_id'):
-    group = group.reset_index(drop=True)
-    refined_modes = balanced_clean_segments_compact(group, mode_col='smoothed_mode_compact', min_len=10)
-    super_cleaned_compact_modes.extend(refined_modes)
-
-test_smoothed_df['super_cleaned_mode_compact'] = super_cleaned_compact_modes
-
-# 원래 레이블 체계로 복원
-test_smoothed_df['super_cleaned_mode'] = test_smoothed_df['super_cleaned_mode_compact'].map(COMPACT_TO_ORIGINAL)
-test_smoothed_df['pred_mode'] = test_smoothed_df['pred_mode_compact'].map(COMPACT_TO_ORIGINAL)
-
-
-# ==========================================
-# 6. 클래스별 성능 평가 지표 (Precision, Recall, F1) 출력
-# ==========================================
-y_true = test_smoothed_df['mode_compact'].values
-y_pred = test_smoothed_df['super_cleaned_mode_compact'].values
-target_names = ['Walk', 'Bike', 'Car', 'Bus', 'Subway']
-
-print("\n" + "=" * 65)
-print("[Test Dataset - 최종 클래스별 성능 평가 리포트]")
-print("=" * 65)
-print(classification_report(y_true, y_pred, target_names=target_names, digits=4, zero_division=0))
-accuracy = accuracy_score(y_true, y_pred)
-print(f"Overall Accuracy: {{accuracy * 100:.2f}}%")
-print("=" * 65)
+    registry_name = "dbw_canopy_dev.ml.canopy_transition_model"
+    
+    mlflow.lightgbm.log_model(
+        lgb_model=model,
+        artifact_path="model",
+        signature=signature,
+        input_example=input_example,
+        registered_model_name=registry_name
+    )
+    print(f"MLflow 모델이 [{registry_name}] 스키마에 성공적으로 등록되었습니다")
