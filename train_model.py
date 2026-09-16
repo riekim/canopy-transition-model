@@ -1,25 +1,23 @@
 import os
-import glob
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
+from sklearn.metrics import accuracy_score
 
-# [추가] MLflow 및 스키마 추론 라이브러리
+# 전처리 모듈 임포트
+from preprocessing import extract_advanced_features_v3
+
 import mlflow
 import mlflow.lightgbm
 from mlflow.models import infer_signature
 
-# ==========================================
-# 1. Parquet 데이터 로드 및 사용자 정의 분할 로직
-# ==========================================
+# 1. 데이터 로드
 if os.path.exists('/content/drive/MyDrive'):
     FINAL_WORK_DIR = os.getenv('DATA_DIR', '/content/drive/MyDrive/canopy/od_gps_processed')
 else:
     FINAL_WORK_DIR = os.getenv('DATA_DIR', './your_data_path_here')
 
-print("Parquet 데이터 로드 중")
+print("Parquet 데이터 로드 중...")
 df_train_full = pd.read_parquet(os.path.join(FINAL_WORK_DIR, 'train_10000.parquet'))
 df_val_full = pd.read_parquet(os.path.join(FINAL_WORK_DIR, 'val_3000.parquet'))
 
@@ -46,23 +44,8 @@ for df in [train_df, val_df, test_df]:
     if 'speed_ms' in df.columns and 'speed' not in df.columns:
         df['speed'] = df['speed_ms']
 
-print(f"데이터 분할 완료")
-
-
-# ==========================================
-# 2. 라벨 정의 및 컴팩트 인덱스 변환 설정
-# ==========================================
-ORIGINAL_MODE_NAMES = {
-    0: "Walk",
-    1: "Bike",
-    2: "Car",
-    3: "Bus",
-    5: "Subway"
-}
-
+# 라벨 인덱스 변환
 TRAIN_TO_COMPACT = {0: 0, 1: 1, 2: 2, 3: 3, 5: 4}
-COMPACT_TO_ORIGINAL = {0: 0, 1: 1, 2: 2, 3: 3, 4: 5}
-
 def apply_compact_labels(df):
     df = df.copy()
     if 'mode' in df.columns:
@@ -73,85 +56,13 @@ train_df = apply_compact_labels(train_df)
 val_df = apply_compact_labels(val_df)
 test_df = apply_compact_labels(test_df)
 
-
-# ==========================================
-# 3. 피처 엔지니어링 함수 정의
-# ==========================================
-def calculate_bearing(lat1, lon1, lat2, lon2):
-    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-    dLon = lon2 - lon1
-    x = np.sin(dLon) * np.cos(lat2)
-    y = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dLon)
-    return np.degrees(np.arctan2(x, y))
-
-def extract_advanced_features_v3(df):
-    processed_dfs = []
-
-    for trip_id, group in df.groupby('trip_id'):
-        group = group.reset_index(drop=True)
-        lat = group['latitude'].values
-        lon = group['longitude'].values
-        ts = group['timestamp'].values.astype(np.float64)
-
-        ts_sec = ts / 1000.0 if ts[0] > 1e11 else ts
-        dt = np.clip(np.diff(ts_sec, prepend=ts_sec[0]), 0.1, None)
-
-        dist = np.zeros(len(group))
-        lat1, lon1, lat2, lon2 = map(np.radians, [lat[:-1], lon[:-1], lat[1:], lon[1:]])
-        dlon = lon2 - lon1
-        dlat = lat2 - lat1
-        a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
-        c = 2 * np.arcsin(np.clip(np.sqrt(a), 0, 1))
-        dist[1:] = 6371000 * c
-
-        speed = (dist / dt) * 3.6
-        acceleration = np.diff(speed, prepend=speed[0]) / dt
-
-        group['speed'] = speed
-        group['acceleration'] = acceleration
-        group['distance'] = dist
-
-        bearings = np.zeros(len(group))
-        if len(group) > 1:
-            bearings[1:] = calculate_bearing(lat[:-1], lon[:-1], lat[1:], lon[1:])
-        bearing_diff = np.abs(np.diff(bearings, prepend=bearings[0]))
-        bearing_diff = np.where(bearing_diff > 180, 360 - bearing_diff, bearing_diff)
-        group['bearing_change'] = bearing_diff
-
-        speed_series = pd.Series(speed)
-        accel_series = pd.Series(acceleration)
-
-        group['speed_mean_5'] = speed_series.rolling(window=5, min_periods=1).mean()
-        group['speed_std_5'] = speed_series.rolling(window=5, min_periods=1).std().fillna(0)
-        group['speed_max_10'] = speed_series.rolling(window=10, min_periods=1).max()
-        group['speed_mean_30'] = speed_series.rolling(window=30, min_periods=1).mean()
-        group['speed_std_30'] = speed_series.rolling(window=30, min_periods=1).std().fillna(0)
-        group['speed_max_60'] = speed_series.rolling(window=60, min_periods=1).max()
-        group['speed_mean_150'] = speed_series.rolling(window=150, min_periods=1).mean()
-
-        is_stopped = (speed < 3.0).astype(int)
-        stopped_series = pd.Series(is_stopped)
-        group['stop_count_60'] = stopped_series.rolling(window=60, min_periods=1).sum()
-        group['stop_count_150'] = stopped_series.rolling(window=150, min_periods=1).sum()
-        group['stoppage_ratio_60'] = stopped_series.rolling(window=60, min_periods=1).mean()
-
-        group['speed_q25_60'] = speed_series.rolling(window=60, min_periods=1).quantile(0.25)
-        group['speed_q75_60'] = speed_series.rolling(window=60, min_periods=1).quantile(0.75)
-        group['accel_std_30'] = accel_series.rolling(window=30, min_periods=1).std().fillna(0)
-
-        processed_dfs.append(group)
-
-    return pd.concat(processed_dfs, ignore_index=True)
-
+# 2. 전처리 함수 적용
 print("피처 추출 진행 중 (Train, Val, Test)...")
 train_df = extract_advanced_features_v3(train_df)
 val_df = extract_advanced_features_v3(val_df)
 test_df = extract_advanced_features_v3(test_df)
 
-
-# ==========================================
-# 4. LightGBM 모델 학습 및 MLflow 로깅
-# ==========================================
+# 3. 모델 학습
 features = [
     'speed', 'acceleration', 'distance', 'bearing_change',
     'speed_mean_5', 'speed_std_5', 'speed_max_10',
@@ -172,103 +83,23 @@ with mlflow.start_run() as run:
     }
     mlflow.log_params(params)
 
-    print("LightGBM 모델 학습 시작...")
+    print("LightGBM 모델 학습 시작")
     model = lgb.LGBMClassifier(**params, n_jobs=-1)
-    
     model.fit(
         X_train, y_train,
         eval_set=[(X_val, y_val)],
         callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)]
     )
 
-    # ==========================================
-    # 5. 테스트 셋 추론 및 보완된 스무딩 적용
-    # ==========================================
-    def apply_balanced_smoothing_to_test(df, model, features, chunk_size=300, window_size=21):
-        processed_chunks = []
-        for trip_id, group in df.groupby('trip_id'):
-            group = group.reset_index(drop=True)
-            total_len = len(group)
+    # 간단 평가
+    preds = model.predict(X_val[features])
+    acc = accuracy_score(y_val, preds)
+    mlflow.log_metric("val_accuracy", acc)
 
-            for start_idx in range(0, total_len, chunk_size):
-                end_idx = min(start_idx + chunk_size, total_len)
-                chunk = group.iloc[start_idx:end_idx].copy()
-
-                if len(chunk) < 5:
-                    continue
-
-                chunk['pred_mode_compact'] = model.predict(chunk[features])
-                chunk['smoothed_mode_compact'] = chunk['pred_mode_compact'].rolling(
-                    window=window_size, center=True, min_periods=1
-                ).apply(lambda s: pd.Series(s).mode()[0], raw=False).astype(int)
-
-                processed_chunks.append(chunk)
-
-        return pd.concat(processed_chunks, ignore_index=True)
-
-    test_smoothed_df = apply_balanced_smoothing_to_test(test_df, model, features, window_size=21)
-
-    def balanced_clean_segments_compact(df_subset, mode_col='smoothed_mode_compact', min_len=10):
-        modes = df_subset[mode_col].values.copy()
-        if len(modes) == 0:
-            return modes
-
-        changed = True
-        iteration = 0
-        while changed and iteration < 5:
-            changed = False
-            iteration += 1
-
-            segments = []
-            start = 0
-            for i in range(1, len(modes)):
-                if modes[i] != modes[start]:
-                    segments.append({'start': start, 'end': i - 1, 'mode': modes[start]})
-                    start = i
-            segments.append({'start': start, 'end': len(modes) - 1, 'mode': modes[start]})
-
-            for idx, seg in enumerate(segments):
-                length = seg['end'] - seg['start'] + 1
-                if length < min_len and len(segments) > 1:
-                    if 0 < idx < len(segments) - 1:
-                        prev_len = segments[idx-1]['end'] - segments[idx-1]['start'] + 1
-                        next_len = segments[idx+1]['end'] - segments[idx+1]['start'] + 1
-                        target_mode = segments[idx-1]['mode'] if prev_len >= next_len else segments[idx+1]['mode']
-                    elif idx > 0:
-                        target_mode = segments[idx-1]['mode']
-                    else:
-                        target_mode = segments[idx+1]['mode']
-
-                    modes[seg['start']:seg['end']+1] = target_mode
-                    changed = True
-                    break
-
-        return modes
-
-    super_cleaned_compact_modes = []
-    for _, group in test_smoothed_df.groupby('trip_id'):
-        group = group.reset_index(drop=True)
-        refined_modes = balanced_clean_segments_compact(group, mode_col='smoothed_mode_compact', min_len=10)
-        super_cleaned_compact_modes.extend(refined_modes)
-
-    test_smoothed_df['super_cleaned_mode_compact'] = super_cleaned_compact_modes
-
-    # 성능 평가 지표 계산
-    y_true = test_smoothed_df['mode_compact'].values
-    y_pred = test_smoothed_df['super_cleaned_mode_compact'].values
-    accuracy = accuracy_score(y_true, y_pred)
-    
-    mlflow.log_metric("test_accuracy", accuracy)
-    print(f"Overall Accuracy: {accuracy * 100:.2f}%")
-
-    # ==========================================
-    # 6. MLflow 모델 등록
-    # ==========================================
+    # 4. MLflow 등록
     input_example = X_val.head(5)
-    predicted_output = model.predict(input_example)
-    signature = infer_signature(input_example, predicted_output)
-
-    registry_name = "dbw_canopy_dev.ml.canopy_transition_model"
+    signature = infer_signature(input_example, model.predict(input_example))
+    registry_name = "dbw_canopy_dev.ml.canopy_transition_lgbm_model"
     
     mlflow.lightgbm.log_model(
         lgb_model=model,
